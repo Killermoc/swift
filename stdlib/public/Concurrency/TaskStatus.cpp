@@ -327,9 +327,7 @@ bool swift::addStatusRecord(
     // Reset the parent of the new record.
     newRecord->resetParent(oldStatus.getInnermostRecord());
 
-    // Set the record as the new innermost record.
     ActiveTaskStatus newStatus = oldStatus.withInnermostRecord(newRecord);
-
     if (shouldAddRecord(oldStatus, newStatus)) {
       // We have to use a release on success to make the initialization of
       // the new record visible to an asynchronous thread trying to modify the
@@ -606,6 +604,10 @@ static void performCancellationAction(TaskStatusRecord *record) {
   // anything to do anyway.
   case TaskStatusRecordKind::Private_RecordLock:
     return;
+
+  // No cancellation action needs to be taken for dependency status records
+  case TaskStatusRecordKind::TaskDependency:
+    break;
   }
 
   // Other cases can fall through here and be ignored.
@@ -690,6 +692,14 @@ static void performEscalationAction(TaskStatusRecord *record,
     return;
   }
 
+  case TaskStatusRecordKind::TaskDependency: {
+    auto dependencyRecord = cast<TaskDependencyStatusRecord>(record);
+    SWIFT_TASK_DEBUG_LOG("[Dependency] Escalating a task dependency record %p to %#x",
+                    record, newPriority);
+    dependencyRecord->performEscalationAction(newPriority);
+    return;
+  }
+
   // Record locks shouldn't be found this way, but they don't have
   // anything to do anyway.
   case TaskStatusRecordKind::Private_RecordLock:
@@ -716,11 +726,16 @@ static swift_task_escalateImpl(AsyncTask *task, JobPriority newPriority) {
       return oldStatus.getStoredPriority();
     }
 
-    // Regardless of whether status record is locked or not, update the priority
-    // and RO bit on the task status
     if (oldStatus.isRunning() || oldStatus.isEnqueued()) {
+      // Regardless of whether status record is locked or not, update the
+      // priority and RO bit on the task status
       newStatus = oldStatus.withEscalatedPriority(newPriority);
+    } else if (oldStatus.isComplete()) {
+      // We raced with concurrent completion, nothing to escalate
+      SWIFT_TASK_DEBUG_LOG("Escalated a task %p which had completed, do nothing", task);
+      return oldStatus.getStoredPriority();
     } else {
+      // Task is suspended.
       newStatus = oldStatus.withNewPriority(newPriority);
     }
 
@@ -731,8 +746,8 @@ static swift_task_escalateImpl(AsyncTask *task, JobPriority newPriority) {
     }
   }
 
-#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
   if (newStatus.isRunning()) {
+#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
     // The task is running, escalate the thread that is running it.
     ActiveTaskStatus *taskStatus;
     dispatch_lock_t *executionLock;
@@ -742,6 +757,7 @@ static swift_task_escalateImpl(AsyncTask *task, JobPriority newPriority) {
 
     SWIFT_TASK_DEBUG_LOG("[Override] Escalating %p which is running on %#x to %#x", task, newStatus.currentExecutionLockOwner(), newPriority);
     swift_dispatch_lock_override_start_with_debounce(executionLock, newStatus.currentExecutionLockOwner(), (qos_class_t) newPriority);
+#endif
   } else if (newStatus.isEnqueued()) {
     //  Task is not running, it's enqueued somewhere waiting to be run
     //
@@ -752,10 +768,12 @@ static swift_task_escalateImpl(AsyncTask *task, JobPriority newPriority) {
     // TODO (rokhinip): Add a signpost to flag that this is a potential
     // priority inversion
     SWIFT_TASK_DEBUG_LOG("[Override] Escalating %p which is enqueued", task);
+
   } else {
     SWIFT_TASK_DEBUG_LOG("[Override] Escalating %p which is suspended to %#x", task, newPriority);
+    // We must have at least one record - the task dependency one.
+    assert(newStatus.getInnermostRecord() != NULL);
   }
-#endif
 
   if (newStatus.getInnermostRecord() == NULL) {
     return newStatus.getStoredPriority();
@@ -767,11 +785,6 @@ static swift_task_escalateImpl(AsyncTask *task, JobPriority newPriority) {
       performEscalationAction(cur, newPriority);
     }
   });
-  // TODO (rokhinip): If the task is awaiting on another task that is not a
-  // child task, we need to escalate whoever we are already awaiting on
-  //
-  // rdar://88093007 (Task escalation does not propagate to a future that it is
-  // waiting on)
 
   return newStatus.getStoredPriority();
 }
